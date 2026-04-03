@@ -1,0 +1,158 @@
+#!/bin/zsh
+
+BASE="$HOME/.pastering"
+HIST="$BASE/history"
+CONFIG_FILE="$BASE/max_history"
+PLIST_FILE="$HOME/Library/LaunchAgents/local.pastering.plist"
+
+mkdir -p "$BASE"
+mkdir -p "$HIST"
+
+CMD="$1"
+ARG="$2"
+
+# Semi-convoluted way of resolving back through symlinks
+TARGET="$0"
+while [[ -L "$TARGET" ]]; do
+    LINK="$(readlink "$TARGET")"
+    if [[ "$LINK" = /* ]]; then
+        TARGET="$LINK"
+    else
+        TARGET="$(dirname "$TARGET")/$LINK"
+    fi
+done
+SCRIPT_DIR="$(cd "$(dirname "$TARGET")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/pastering"
+
+case "$CMD" in
+    start)
+        if launchctl list "local.pastering" &> /dev/null; then
+            echo "pastering is already running. Please run 'pastering stop' first."
+            exit 1
+        fi
+
+        MAX=${ARG:-5}
+        echo "$MAX" > "$CONFIG_FILE"
+
+        # Compile pbcount if it doesn't exist
+        if [[ ! -f "$SCRIPT_DIR/pbcount" ]]; then
+            swiftc "$SCRIPT_DIR/pbcount.swift" -o "$SCRIPT_DIR/pbcount"
+        fi
+
+        # Config file for launchd (background service manager)
+        cat <<EOF > "$PLIST_FILE"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.pastering</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$SCRIPT_PATH</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+        launchctl unload "$PLIST_FILE" 2>/dev/null
+        launchctl load "$PLIST_FILE"
+        echo "Started pastering daemon (max history: $MAX). Will persist across restarts."
+        ;;
+
+    stop)
+        if [[ -f "$PLIST_FILE" ]]; then
+            launchctl unload "$PLIST_FILE" 2>/dev/null
+            rm -f "$PLIST_FILE"
+        fi
+
+        # Kill the daemon if still running
+        pkill -f "pastering daemon" 2>/dev/null
+        echo "Stopped pastering daemon."
+        ;;
+
+    show)
+        if [[ -n "$ARG" ]]; then
+            if [[ -f "$HIST/$ARG" ]]; then
+                cat "$HIST/$ARG"
+                echo "" # Trailing newline
+            else
+                echo "No history at index $ARG"
+            fi
+        else
+            MAX=$(cat "$CONFIG_FILE" 2>/dev/null || echo 5)
+            echo "--- Clipboard History (Latest first) ---"
+            for ((i=1; i<=MAX; i++)); do
+                if [[ -f "$HIST/$i" ]]; then
+                    CONTENT="$(head -n 1 "$HIST/$i" | cut -c 1-80)"
+                    RAW_LEN="$(wc -c < "$HIST/$i" | tr -d ' ')"
+                    TRUNC_LEN="$(echo -n "$CONTENT" | wc -c | tr -d ' ')"
+                    if [[ "$RAW_LEN" -gt "$TRUNC_LEN" ]]; then
+                        CONTENT="$CONTENT..."
+                    fi
+                    echo "$i: $CONTENT"
+                fi
+            done
+        fi
+        ;;
+
+    [1-9]|[1-9][0-9])
+        if [[ -f "$HIST/$CMD" ]]; then
+            cat "$HIST/$CMD" | pbcopy
+            echo "Restored item $CMD to clipboard."
+        else
+            echo "No history at index $CMD"
+        fi
+        ;;
+
+    daemon)
+        LAST_COUNT=""
+
+        while true; do
+            # Use pbcount (swiftc-compiled) helper to get clipboard count
+            # Prevents going through large clipboards unless changed
+            CUR_COUNT="$("$SCRIPT_DIR/pbcount" 2>/dev/null)"
+
+            if [[ -n "$CUR_COUNT" && "$CUR_COUNT" != "$LAST_COUNT" ]]; then
+                LAST_COUNT="$CUR_COUNT"
+
+                CUR="$(pbpaste 2>/dev/null)"
+
+                if [[ -n "$CUR" ]]; then
+                    if [[ -f "$HIST/1" ]]; then
+                        PREV="$(cat "$HIST/1")"
+                    else
+                        PREV=""
+                    fi
+
+                    if [[ "$CUR" != "$PREV" ]]; then
+                        # Re-read the MAX entries wanted (in case it changed)
+                        MAX=$(cat "$CONFIG_FILE" 2>/dev/null || echo 5)
+                        # Shift all by one
+                        for ((i=MAX; i>1; i--)); do
+                            [[ -f "$HIST/$((i-1))" ]] && mv "$HIST/$((i-1))" "$HIST/$i"
+                        done
+
+                        printf "%s" "$CUR" > "$HIST/1"
+                    fi
+                fi
+            fi
+
+            sleep 0.5
+        done
+        ;;
+
+    *)
+        echo "Usage:"
+        echo "  pastering start [N]  - start the daemon (default N=5)"
+        echo "  pastering stop       - stop the daemon"
+        echo "  pastering show       - list history items"
+        echo "  pastering show [N]   - show full text of item N"
+        echo "  pastering [N]        - restore item N to clipboard"
+        ;;
+esac
